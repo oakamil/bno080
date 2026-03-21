@@ -249,42 +249,49 @@ where
     /// Handle parsing of an input report packet,
     /// which may include multiple input reports
     fn handle_sensor_reports(&mut self, received_len: usize) {
-        // Sensor input packets have the form:
-        // [u8; 5]  timestamp in microseconds for the packet?
-        // a sequence of n reports, each with four byte header
-        // u8 report ID
-        // u8 sequence number of report
-
-        // let mut report_count = 0;
-        let mut outer_cursor: usize = PACKET_HEADER_LENGTH + 5; //skip header, timestamp
-                                                                //TODO need to skip more above for a payload-level timestamp??
+        let mut outer_cursor: usize = PACKET_HEADER_LENGTH + 5; // skip header and timestamp
+                                                                
         if received_len < outer_cursor {
             #[cfg(feature = "rttdebug")]
             rprintln!("bad lens: {} < {}", received_len, outer_cursor);
             return;
         }
 
-        let payload_len = received_len - outer_cursor;
-        if payload_len < 14 {
-            #[cfg(feature = "rttdebug")]
-            rprintln!(
-                "bad report: {:?}",
-                &self.packet_recv_buf[..PACKET_HEADER_LENGTH]
-            );
+        // Loop through the packet payload as long as there is enough room for at least a report header (4 bytes)
+        while (received_len > outer_cursor) && (received_len - outer_cursor >= 4) {
+            let report_id = self.packet_recv_buf[outer_cursor];
+            
+            // Dynamically determine the exact length of the report based on its ID
+            let report_len = match report_id {
+                SENSOR_REPORTID_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
+                SENSOR_REPORTID_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
+                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO | 0x01 | 0x02 | 0x03 | 0x06 => 10, // 3-axis vectors
+                _ => {
+                    // We encountered an unknown report ID. 
+                    // Break out entirely to avoid misaligning the cursor and corrupting subsequent batched reports.
+                    break;
+                }
+            };
 
-            return;
-        }
+            // Ensure we actually have all the bytes for this report in the buffer
+            if received_len - outer_cursor < report_len {
+                break; 
+            }
 
-        // there may be multiple reports per payload
-        while outer_cursor < payload_len {
-            //let start_cursor = outer_cursor;
-            let (inner_cursor, report_id, data1, data2, data3, data4, data5) =
+            let report_end = outer_cursor + report_len;
+            
+            // Slice the buffer EXACTLY to the bounds of the current report length. 
+            // This prevents the eager i16 reader from consuming bytes that belong to the *next* batched report.
+            let (_inner_cursor, _parsed_id, data1, data2, data3, data4, data5) =
                 Self::handle_one_input_report(
                     outer_cursor,
-                    &self.packet_recv_buf[..received_len],
+                    &self.packet_recv_buf[..report_end],
                 );
-            outer_cursor = inner_cursor;
-            // report_count += 1;
+            
+            // Manually advance the cursor by the known physical length of the report
+            outer_cursor = report_end;
+
+            // Route the successfully parsed data to the right state variable
             match report_id {
                 SENSOR_REPORTID_ROTATION_VECTOR => {
                     self.update_rotation_quaternion(
@@ -302,14 +309,9 @@ where
                 SENSOR_REPORTID_GYRO => {
                     self.update_gyro_cal(data1, data2, data3);
                 }
-                _ => {
-                    // debug_println!("uhr: {:X}", report_id);
-                    // debug_println!("uhr: 0x{:X} {:?}  ", report_id, &self.packet_recv_buf[start_cursor..start_cursor+5]);
-                }
+                _ => {}
             }
         }
-
-        //debug_println!("report_count: {}",report_count);
     }
 
     /// Given a set of quaternion values in the Q-fixed-point format,
