@@ -61,6 +61,9 @@ pub struct BNO080<SI> {
     /// Heading accuracy of rotation vector (radians)
     rot_quaternion_acc: f32,
 
+    /// Game rotation vector as unit quaternion
+    game_rotation_quaternion: [f32; 4],
+
     /// Linear acceleration vector
     linear_accel: [f32; 3],
 
@@ -87,6 +90,7 @@ impl<SI> BNO080<SI> {
             last_command_chan_rid: 0,
             rotation_quaternion: [0.0; 4],
             rot_quaternion_acc: 0.0,
+            game_rotation_quaternion: [0.0; 4],
             linear_accel: [0.0; 3],
             gyro: [0.0; 3],
         }
@@ -287,6 +291,11 @@ where
                         data1, data2, data3, data4, data5,
                     );
                 }
+                SENSOR_REPORTID_GAME_ROTATION_VECTOR => {
+                    self.update_game_rotation_quaternion(
+                        data1, data2, data3, data4,
+                    );
+                }
                 SENSOR_REPORTID_LINEAR_ACCEL => {
                     self.update_linear_accel(data1, data2, data3);
                 }
@@ -321,6 +330,23 @@ where
             q14_to_f32(q_r),
         ];
         self.rot_quaternion_acc = q12_to_f32(q_a);
+    }
+
+    /// Given a set of game quaternion values in the Q-fixed-point format,
+    /// calculate and update the corresponding float values
+    fn update_game_rotation_quaternion(
+        &mut self,
+        q_i: i16,
+        q_j: i16,
+        q_k: i16,
+        q_r: i16,
+    ) {
+        self.game_rotation_quaternion = [
+            q14_to_f32(q_i),
+            q14_to_f32(q_j),
+            q14_to_f32(q_k),
+            q14_to_f32(q_r),
+        ];
     }
 
     /// Given a set of linear acceleration values in the Q-fixed-point format,
@@ -498,6 +524,19 @@ where
         )
     }
 
+    /// Tell the sensor to start reporting the game rotation vector
+    /// on a regular cadence. Note that the maximum valid update rate
+    /// is 1 kHz, based on the max update rate of the sensor's gyros.
+    pub fn enable_game_rotation_vector(
+        &mut self,
+        millis_between_reports: u16,
+    ) -> Result<(), WrapperError<SE>> {
+        self.enable_report(
+            SENSOR_REPORTID_GAME_ROTATION_VECTOR,
+            millis_between_reports,
+        )
+    }
+
     /// Enables reporting of linear acceleration vector.
     pub fn enable_linear_accel(
         &mut self,
@@ -663,6 +702,15 @@ where
         self.rot_quaternion_acc
     }
 
+    /// Read game rotation normalized quaternion:
+    /// QX normalized quaternion – X, or Heading | range: 0.0 – 1.0 ( ±π )
+    /// QY normalized quaternion – Y, or Pitch   | range: 0.0 – 1.0 ( ±π/2 )
+    /// QZ normalized quaternion – Z, or Roll    | range: 0.0 – 1.0 ( ±π )
+    /// QW normalized quaternion – W, or 0.0     | range: 0.0 – 1.0
+    pub fn game_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+        Ok(self.game_rotation_quaternion)
+    }
+
     /// Read linear acceleration (m/s^2)
     pub fn linear_accel(&self) -> Result<[f32; 3], WrapperError<SE>> {
         Ok(self.linear_accel)
@@ -788,7 +836,8 @@ const SENSOR_REPORTID_ROTATION_VECTOR: u8 = 0x05;
 // const SENSOR_REPORTID_GRAVITY: u8 = 0x06; // Q point 8
 /// Gyroscope uncalibrated (rad/s): Q point 9
 const SENSOR_REPORTID_GYRO: u8 = 0x07;
-// 0x08 game rotation vector : Q point 14
+/// Game rotation vector: Q point 14
+const SENSOR_REPORTID_GAME_ROTATION_VECTOR: u8 = 0x08;
 // 0x09 geomagnetic rotation vector: Q point 14 for quaternion, Q point 12 for heading accuracy
 // 0x0A pressure (hectopascals) from external baro: Q point 20
 // 0x0B ambient light (lux) from external sensor: Q point 8
