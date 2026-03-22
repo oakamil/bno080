@@ -64,6 +64,14 @@ pub struct BNO080<SI> {
     /// Game rotation vector as unit quaternion
     game_rotation_quaternion: [f32; 4],
 
+    /// AR/VR Stabilized Rotation vector as unit quaternion
+    arvr_rotation_quaternion: [f32; 4],
+    /// Heading accuracy of AR/VR rotation vector (radians)
+    arvr_rot_quaternion_acc: f32,
+
+    /// AR/VR Stabilized Game rotation vector as unit quaternion
+    arvr_game_rotation_quaternion: [f32; 4],
+
     /// Linear acceleration vector
     linear_accel: [f32; 3],
 
@@ -91,6 +99,9 @@ impl<SI> BNO080<SI> {
             rotation_quaternion: [0.0; 4],
             rot_quaternion_acc: 0.0,
             game_rotation_quaternion: [0.0; 4],
+            arvr_rotation_quaternion: [0.0; 4],
+            arvr_rot_quaternion_acc: 0.0,
+            arvr_game_rotation_quaternion: [0.0; 4],
             linear_accel: [0.0; 3],
             gyro: [0.0; 3],
         }
@@ -263,8 +274,8 @@ where
             
             // Dynamically determine the exact length of the report based on its ID
             let report_len = match report_id {
-                SENSOR_REPORTID_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
-                SENSOR_REPORTID_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
+                SENSOR_REPORTID_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
+                SENSOR_REPORTID_GAME_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
                 SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO | 0x01 | 0x02 | 0x03 | 0x06 => 10, // 3-axis vectors
                 _ => {
                     // We encountered an unknown report ID. 
@@ -300,6 +311,16 @@ where
                 }
                 SENSOR_REPORTID_GAME_ROTATION_VECTOR => {
                     self.update_game_rotation_quaternion(
+                        data1, data2, data3, data4,
+                    );
+                }
+                SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR => {
+                    self.update_arvr_rotation_quaternion(
+                        data1, data2, data3, data4, data5,
+                    );
+                }
+                SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => {
+                    self.update_arvr_game_rotation_quaternion(
                         data1, data2, data3, data4,
                     );
                 }
@@ -344,6 +365,42 @@ where
         q_r: i16,
     ) {
         self.game_rotation_quaternion = [
+            q14_to_f32(q_i),
+            q14_to_f32(q_j),
+            q14_to_f32(q_k),
+            q14_to_f32(q_r),
+        ];
+    }
+
+    /// Given a set of AR/VR stabilized quaternion values in the Q-fixed-point format,
+    /// calculate and update the corresponding float values
+    fn update_arvr_rotation_quaternion(
+        &mut self,
+        q_i: i16,
+        q_j: i16,
+        q_k: i16,
+        q_r: i16,
+        q_a: i16,
+    ) {
+        self.arvr_rotation_quaternion = [
+            q14_to_f32(q_i),
+            q14_to_f32(q_j),
+            q14_to_f32(q_k),
+            q14_to_f32(q_r),
+        ];
+        self.arvr_rot_quaternion_acc = q12_to_f32(q_a);
+    }
+
+    /// Given a set of AR/VR stabilized game quaternion values in the Q-fixed-point format,
+    /// calculate and update the corresponding float values
+    fn update_arvr_game_rotation_quaternion(
+        &mut self,
+        q_i: i16,
+        q_j: i16,
+        q_k: i16,
+        q_r: i16,
+    ) {
+        self.arvr_game_rotation_quaternion = [
             q14_to_f32(q_i),
             q14_to_f32(q_j),
             q14_to_f32(q_k),
@@ -539,6 +596,30 @@ where
         )
     }
 
+    /// Tell the sensor to start reporting the AR/VR stabilized rotation vector
+    /// on a regular cadence.
+    pub fn enable_arvr_stabilized_rotation_vector(
+        &mut self,
+        millis_between_reports: u16,
+    ) -> Result<(), WrapperError<SE>> {
+        self.enable_report(
+            SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR,
+            millis_between_reports,
+        )
+    }
+
+    /// Tell the sensor to start reporting the AR/VR stabilized game rotation vector
+    /// on a regular cadence.
+    pub fn enable_arvr_stabilized_game_rotation_vector(
+        &mut self,
+        millis_between_reports: u16,
+    ) -> Result<(), WrapperError<SE>> {
+        self.enable_report(
+            SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR,
+            millis_between_reports,
+        )
+    }
+
     /// Enables reporting of linear acceleration vector.
     pub fn enable_linear_accel(
         &mut self,
@@ -705,12 +786,22 @@ where
     }
 
     /// Read game rotation normalized quaternion:
-    /// QX normalized quaternion – X, or Heading | range: 0.0 – 1.0 ( ±π )
-    /// QY normalized quaternion – Y, or Pitch   | range: 0.0 – 1.0 ( ±π/2 )
-    /// QZ normalized quaternion – Z, or Roll    | range: 0.0 – 1.0 ( ±π )
-    /// QW normalized quaternion – W, or 0.0     | range: 0.0 – 1.0
     pub fn game_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
         Ok(self.game_rotation_quaternion)
+    }
+
+    /// Read AR/VR stabilized normalized quaternion:
+    pub fn arvr_stabilized_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+        Ok(self.arvr_rotation_quaternion)
+    }
+
+    pub fn arvr_stabilized_heading_accuracy(&self) -> f32 {
+        self.arvr_rot_quaternion_acc
+    }
+
+    /// Read AR/VR stabilized game rotation normalized quaternion:
+    pub fn arvr_stabilized_game_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+        Ok(self.arvr_game_rotation_quaternion)
     }
 
     /// Read linear acceleration (m/s^2)
@@ -846,6 +937,11 @@ const SENSOR_REPORTID_GAME_ROTATION_VECTOR: u8 = 0x08;
 // 0x0C humidity (percent) from external sensor: Q point 8
 // 0x0D proximity (centimeters) from external sensor: Q point 4
 // 0x0E temperature (degrees C) from external sensor: Q point 7
+
+/// AR/VR Stabilized Rotation Vector: Q point 14 for quaternion, Q point 12 for heading accuracy
+pub const SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR: u8 = 0x28;
+/// AR/VR Stabilized Game Rotation Vector: Q point 14
+pub const SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR: u8 = 0x29;
 
 /// executable/device channel responses
 /// Figure 1-27: SHTP executable commands and response
