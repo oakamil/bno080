@@ -75,8 +75,18 @@ pub struct BNO080<SI> {
     /// Linear acceleration vector
     linear_accel: [f32; 3],
 
-    /// Gyroscope calibrated data
-    gyro: [f32; 3],
+    /// Gyroscope uncalibrated data queue (timestamp, [x, y, z])
+    gyro_queue: [(u32, [f32; 3]); 32],
+    gyro_queue_head: usize,
+    gyro_queue_len: usize,
+
+    /// Gyroscope calibrated data (0x02) queue
+    calibrated_gyro_queue: [(u32, [f32; 3]); 32],
+    calibrated_gyro_queue_head: usize,
+    calibrated_gyro_queue_len: usize,
+
+    /// Base timestamp of the last received report packet
+    timestamp: u32,
 }
 
 impl<SI> BNO080<SI> {
@@ -103,7 +113,13 @@ impl<SI> BNO080<SI> {
             arvr_rot_quaternion_acc: 0.0,
             arvr_game_rotation_quaternion: [0.0; 4],
             linear_accel: [0.0; 3],
-            gyro: [0.0; 3],
+            gyro_queue: [(0, [0.0; 3]); 32],
+            gyro_queue_head: 0,
+            gyro_queue_len: 0,
+            calibrated_gyro_queue: [(0, [0.0; 3]); 32],
+            calibrated_gyro_queue_head: 0,
+            calibrated_gyro_queue_len: 0,
+            timestamp: 0,
         }
     }
 
@@ -238,13 +254,13 @@ where
     fn handle_one_input_report(
         outer_cursor: usize,
         msg: &[u8],
-    ) -> (usize, u8, i16, i16, i16, i16, i16) {
+    ) -> (usize, u8, u8, i16, i16, i16, i16, i16) {
         let mut cursor = outer_cursor;
 
         let feature_report_id = Self::read_u8_at_cursor(msg, &mut cursor);
         let _rep_seq_num = Self::read_u8_at_cursor(msg, &mut cursor);
         let _rep_status = Self::read_u8_at_cursor(msg, &mut cursor);
-        let _delay = Self::read_u8_at_cursor(msg, &mut cursor);
+        let delay = Self::read_u8_at_cursor(msg, &mut cursor);
 
         let data1: i16 = Self::read_i16_at_cursor(msg, &mut cursor);
         let data2: i16 = Self::read_i16_at_cursor(msg, &mut cursor);
@@ -254,13 +270,25 @@ where
         let data5: i16 =
             Self::try_read_i16_at_cursor(msg, &mut cursor).unwrap_or(0);
 
-        (cursor, feature_report_id, data1, data2, data3, data4, data5)
+        (cursor, feature_report_id, delay, data1, data2, data3, data4, data5)
     }
 
     /// Handle parsing of an input report packet,
     /// which may include multiple input reports
     fn handle_sensor_reports(&mut self, received_len: usize) {
+        if received_len >= PACKET_HEADER_LENGTH + 4 {
+            let base_0 = self.packet_recv_buf[PACKET_HEADER_LENGTH];
+            let base_1 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 1];
+            let base_2 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 2];
+            let base_3 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 3];
+            self.timestamp = (base_0 as u32)
+                | ((base_1 as u32) << 8)
+                | ((base_2 as u32) << 16)
+                | ((base_3 as u32) << 24);
+        }
+
         let mut outer_cursor: usize = PACKET_HEADER_LENGTH + 5; // skip header and timestamp
+
                                                                 
         if received_len < outer_cursor {
             #[cfg(feature = "rttdebug")]
@@ -276,7 +304,7 @@ where
             let report_len = match report_id {
                 SENSOR_REPORTID_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
                 SENSOR_REPORTID_GAME_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
-                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO | 0x01 | 0x02 | 0x03 | 0x06 => 10, // 3-axis vectors
+                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO | SENSOR_REPORTID_GYRO_CALIBRATED | 0x01 | 0x03 | 0x06 => 10, // 3-axis vectors
                 _ => {
                     // We encountered an unknown report ID. 
                     // Break out entirely to avoid misaligning the cursor and corrupting subsequent batched reports.
@@ -293,7 +321,7 @@ where
             
             // Slice the buffer EXACTLY to the bounds of the current report length. 
             // This prevents the eager i16 reader from consuming bytes that belong to the *next* batched report.
-            let (_inner_cursor, _parsed_id, data1, data2, data3, data4, data5) =
+            let (_inner_cursor, _parsed_id, delay, data1, data2, data3, data4, data5) =
                 Self::handle_one_input_report(
                     outer_cursor,
                     &self.packet_recv_buf[..report_end],
@@ -328,7 +356,10 @@ where
                     self.update_linear_accel(data1, data2, data3);
                 }
                 SENSOR_REPORTID_GYRO => {
-                    self.update_gyro_cal(data1, data2, data3);
+                    self.update_gyro(data1, data2, data3, delay);
+                }
+                SENSOR_REPORTID_GYRO_CALIBRATED => {
+                    self.update_gyro_calibrated(data1, data2, data3, delay);
                 }
                 _ => {}
             }
@@ -418,14 +449,34 @@ where
         self.linear_accel = [x, y, z];
     }
 
+    /// Update uncalibrated gyro data
     /// Given a set of linear acceleration values in the Q-fixed-point format,
     /// calculate and update the corresponding float values
-    fn update_gyro_cal(&mut self, x: i16, y: i16, z: i16) {
-        let x = q9_to_f32(x);
-        let y = q9_to_f32(y);
-        let z = q9_to_f32(z);
+    fn update_gyro(&mut self, x: i16, y: i16, z: i16, delay: u8) {
+        let timestamp = self.timestamp.wrapping_add(delay as u32);
+        self.gyro_queue[self.gyro_queue_head] = (timestamp, [
+            q9_to_f32(x),
+            q9_to_f32(y),
+            q9_to_f32(z),
+        ]);
+        self.gyro_queue_head = (self.gyro_queue_head + 1) % 32;
+        if self.gyro_queue_len < 32 {
+            self.gyro_queue_len += 1;
+        }
+    }
 
-        self.gyro = [x, y, z];
+    /// Update calibrated gyro data
+    fn update_gyro_calibrated(&mut self, x: i16, y: i16, z: i16, delay: u8) {
+        let timestamp = self.timestamp.wrapping_add(delay as u32);
+        self.calibrated_gyro_queue[self.calibrated_gyro_queue_head] = (timestamp, [
+            q9_to_f32(x),
+            q9_to_f32(y),
+            q9_to_f32(z),
+        ]);
+        self.calibrated_gyro_queue_head = (self.calibrated_gyro_queue_head + 1) % 32;
+        if self.calibrated_gyro_queue_len < 32 {
+            self.calibrated_gyro_queue_len += 1;
+        }
     }
 
     /// Handle one or more errors sent in response to a command
@@ -636,6 +687,14 @@ where
         self.enable_report(SENSOR_REPORTID_GYRO, millis_between_reports)
     }
 
+    /// Enables reporting of calibrated gyroscope data.
+    pub fn enable_gyro_calibrated(
+        &mut self,
+        millis_between_reports: u16,
+    ) -> Result<(), WrapperError<SE>> {
+        self.enable_report(SENSOR_REPORTID_GYRO_CALIBRATED, millis_between_reports)
+    }
+
     /// Enable a particular report
     fn enable_report(
         &mut self,
@@ -809,9 +868,65 @@ where
         Ok(self.linear_accel)
     }
 
-    /// Read gyroscope data (rad/s)
+    /// Drain the uncalibrated gyro queue (returns length and array of (timestamp, [rad/s]))
+    pub fn gyro_queue(&mut self) -> (usize, [(u32, [f32; 3]); 32]) {
+        let mut ordered_queue = [(0, [0.0; 3]); 32];
+        let len = self.gyro_queue_len;
+
+        if len > 0 {
+            let mut current = (self.gyro_queue_head + 32 - len) % 32;
+            for i in 0..len {
+                ordered_queue[i] = self.gyro_queue[current];
+                current = (current + 1) % 32;
+            }
+        }
+
+        self.gyro_queue_head = 0;
+        self.gyro_queue_len = 0;
+        (len, ordered_queue)
+    }
+
+    /// Read the latest gyroscope data (rad/s) for backwards compatibility
     pub fn gyro(&self) -> Result<[f32; 3], WrapperError<SE>> {
-        Ok(self.gyro)
+        if self.gyro_queue_len > 0 {
+            let last_idx = (self.gyro_queue_head + 32 - 1) % 32;
+            Ok(self.gyro_queue[last_idx].1)
+        } else {
+            Ok(self.gyro_queue[0].1)
+        }
+    }
+
+    /// Drain the calibrated gyro queue
+    pub fn calibrated_gyro_queue(&mut self) -> (usize, [(u32, [f32; 3]); 32]) {
+        let mut ordered_queue = [(0, [0.0; 3]); 32];
+        let len = self.calibrated_gyro_queue_len;
+
+        if len > 0 {
+            let mut current = (self.calibrated_gyro_queue_head + 32 - len) % 32;
+            for i in 0..len {
+                ordered_queue[i] = self.calibrated_gyro_queue[current];
+                current = (current + 1) % 32;
+            }
+        }
+
+        self.calibrated_gyro_queue_head = 0;
+        self.calibrated_gyro_queue_len = 0;
+        (len, ordered_queue)
+    }
+
+    /// Read the latest calibrated gyroscope data (rad/s) for backwards compatibility
+    pub fn gyro_calibrated(&self) -> Result<[f32; 3], WrapperError<SE>> {
+        if self.calibrated_gyro_queue_len > 0 {
+            let last_idx = (self.calibrated_gyro_queue_head + 32 - 1) % 32;
+            Ok(self.calibrated_gyro_queue[last_idx].1)
+        } else {
+            Ok(self.calibrated_gyro_queue[0].1)
+        }
+    }
+
+    /// Read the timestamp of the last received sensor packet
+    pub fn timestamp(&self) -> u32 {
+        self.timestamp
     }
 
     /// Tell the sensor to reset.
@@ -929,6 +1044,8 @@ const SENSOR_REPORTID_ROTATION_VECTOR: u8 = 0x05;
 // const SENSOR_REPORTID_GRAVITY: u8 = 0x06; // Q point 8
 /// Gyroscope uncalibrated (rad/s): Q point 9
 const SENSOR_REPORTID_GYRO: u8 = 0x07;
+/// Gyroscope calibrated (rad/s): Q point 9
+const SENSOR_REPORTID_GYRO_CALIBRATED: u8 = 0x02;
 /// Game rotation vector: Q point 14
 const SENSOR_REPORTID_GAME_ROTATION_VECTOR: u8 = 0x08;
 // 0x09 geomagnetic rotation vector: Q point 14 for quaternion, Q point 12 for heading accuracy
