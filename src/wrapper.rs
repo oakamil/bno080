@@ -304,7 +304,8 @@ where
             let report_len = match report_id {
                 SENSOR_REPORTID_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
                 SENSOR_REPORTID_GAME_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
-                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO | SENSOR_REPORTID_GYRO_CALIBRATED | 0x01 | 0x03 | 0x06 => 10, // 3-axis vectors
+                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO_CALIBRATED | 0x01 | 0x03 | 0x06 => 10, // 3-axis vectors
+                SENSOR_REPORTID_GYRO => 16, // 3-axis vectors + 2-byte biases per axis
                 _ => {
                     // We encountered an unknown report ID. 
                     // Break out entirely to avoid misaligning the cursor and corrupting subsequent batched reports.
