@@ -254,13 +254,18 @@ where
     fn handle_one_input_report(
         outer_cursor: usize,
         msg: &[u8],
-    ) -> (usize, u8, u8, i16, i16, i16, i16, i16) {
+    ) -> (usize, u8, u16, i16, i16, i16, i16, i16) {
         let mut cursor = outer_cursor;
 
         let feature_report_id = Self::read_u8_at_cursor(msg, &mut cursor);
         let _rep_seq_num = Self::read_u8_at_cursor(msg, &mut cursor);
         let _rep_status = Self::read_u8_at_cursor(msg, &mut cursor);
-        let delay = Self::read_u8_at_cursor(msg, &mut cursor);
+        let delay_lsb = Self::read_u8_at_cursor(msg, &mut cursor);
+
+        // The 14-bit delay field represents the time elapsed between the sample's physical generation 
+        // and the packet's Base Timestamp, in units of 100-microsecond ticks (0.1ms).
+        // It provides the exact relative microsecond spacing for samples batched within the same packet.
+        let delay = (((_rep_status & 0xFC) as u16) << 6) | (delay_lsb as u16);
 
         let data1: i16 = Self::read_i16_at_cursor(msg, &mut cursor);
         let data2: i16 = Self::read_i16_at_cursor(msg, &mut cursor);
@@ -276,23 +281,9 @@ where
     /// Handle parsing of an input report packet,
     /// which may include multiple input reports
     fn handle_sensor_reports(&mut self, received_len: usize) {
-        if received_len >= PACKET_HEADER_LENGTH + 4 {
-            let base_0 = self.packet_recv_buf[PACKET_HEADER_LENGTH];
-            let base_1 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 1];
-            let base_2 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 2];
-            let base_3 = self.packet_recv_buf[PACKET_HEADER_LENGTH + 3];
-            self.timestamp = (base_0 as u32)
-                | ((base_1 as u32) << 8)
-                | ((base_2 as u32) << 16)
-                | ((base_3 as u32) << 24);
-        }
+        let mut outer_cursor: usize = PACKET_HEADER_LENGTH;
 
-        let mut outer_cursor: usize = PACKET_HEADER_LENGTH + 5; // skip header and timestamp
-
-                                                                
-        if received_len < outer_cursor {
-            #[cfg(feature = "rttdebug")]
-            rprintln!("bad lens: {} < {}", received_len, outer_cursor);
+        if received_len <= outer_cursor {
             return;
         }
 
@@ -302,6 +293,8 @@ where
             
             // Dynamically determine the exact length of the report based on its ID
             let report_len = match report_id {
+                0xFB => 5, // Base Timestamp Reference
+                0xFA => 5, // Timestamp Rebase
                 SENSOR_REPORTID_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
                 SENSOR_REPORTID_GAME_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
                 SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO_CALIBRATED | 0x01 | 0x03 | 0x06 => 10, // 3-axis vectors
@@ -319,6 +312,33 @@ where
             }
 
             let report_end = outer_cursor + report_len;
+
+            if report_id == 0xFB {
+                let base_0 = self.packet_recv_buf[outer_cursor + 1];
+                let base_1 = self.packet_recv_buf[outer_cursor + 2];
+                let base_2 = self.packet_recv_buf[outer_cursor + 3];
+                let base_3 = self.packet_recv_buf[outer_cursor + 4];
+                self.timestamp = (base_0 as u32)
+                    | ((base_1 as u32) << 8)
+                    | ((base_2 as u32) << 16)
+                    | ((base_3 as u32) << 24);
+                outer_cursor = report_end;
+                continue;
+            }
+
+            if report_id == 0xFA {
+                let base_0 = self.packet_recv_buf[outer_cursor + 1];
+                let base_1 = self.packet_recv_buf[outer_cursor + 2];
+                let base_2 = self.packet_recv_buf[outer_cursor + 3];
+                let base_3 = self.packet_recv_buf[outer_cursor + 4];
+                let rebase = (base_0 as u32)
+                    | ((base_1 as u32) << 8)
+                    | ((base_2 as u32) << 16)
+                    | ((base_3 as u32) << 24);
+                self.timestamp = self.timestamp.wrapping_add(rebase);
+                outer_cursor = report_end;
+                continue;
+            }
             
             // Slice the buffer EXACTLY to the bounds of the current report length. 
             // This prevents the eager i16 reader from consuming bytes that belong to the *next* batched report.
@@ -453,7 +473,7 @@ where
     /// Update uncalibrated gyro data
     /// Given a set of linear acceleration values in the Q-fixed-point format,
     /// calculate and update the corresponding float values
-    fn update_gyro(&mut self, x: i16, y: i16, z: i16, delay: u8) {
+    fn update_gyro(&mut self, x: i16, y: i16, z: i16, delay: u16) {
         let timestamp = self.timestamp.wrapping_add(delay as u32);
         self.gyro_queue[self.gyro_queue_head] = (timestamp, [
             q9_to_f32(x),
@@ -467,7 +487,7 @@ where
     }
 
     /// Update calibrated gyro data
-    fn update_gyro_calibrated(&mut self, x: i16, y: i16, z: i16, delay: u8) {
+    fn update_gyro_calibrated(&mut self, x: i16, y: i16, z: i16, delay: u16) {
         let timestamp = self.timestamp.wrapping_add(delay as u32);
         self.calibrated_gyro_queue[self.calibrated_gyro_queue_head] = (timestamp, [
             q9_to_f32(x),
