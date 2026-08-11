@@ -3,7 +3,7 @@ Copyright (c) 2020 Todd Stellanova
 LICENSE: BSD3 (see LICENSE file)
 */
 
-use crate::interface::{SensorInterface, PACKET_HEADER_LENGTH};
+use crate::interface::{PACKET_HEADER_LENGTH, SensorInterface};
 
 use core::ops::Shr;
 
@@ -80,6 +80,11 @@ pub struct BNO080<SI> {
     gyro_queue_head: usize,
     gyro_queue_len: usize,
 
+    /// Accelerometer data queue (timestamp, [x, y, z])
+    accel_queue: [(u32, [f32; 3]); 32],
+    accel_queue_head: usize,
+    accel_queue_len: usize,
+
     /// Gyroscope calibrated data (0x02) queue
     calibrated_gyro_queue: [(u32, [f32; 3]); 32],
     calibrated_gyro_queue_head: usize,
@@ -116,6 +121,9 @@ impl<SI> BNO080<SI> {
             gyro_queue: [(0, [0.0; 3]); 32],
             gyro_queue_head: 0,
             gyro_queue_len: 0,
+            accel_queue: [(0, [0.0; 3]); 32],
+            accel_queue_head: 0,
+            accel_queue_len: 0,
             calibrated_gyro_queue: [(0, [0.0; 3]); 32],
             calibrated_gyro_queue_head: 0,
             calibrated_gyro_queue_len: 0,
@@ -262,7 +270,7 @@ where
         let _rep_status = Self::read_u8_at_cursor(msg, &mut cursor);
         let delay_lsb = Self::read_u8_at_cursor(msg, &mut cursor);
 
-        // The 14-bit delay field represents the time elapsed between the sample's physical generation 
+        // The 14-bit delay field represents the time elapsed between the sample's physical generation
         // and the packet's Base Timestamp, in units of 100-microsecond ticks (0.1ms).
         // It provides the exact relative microsecond spacing for samples batched within the same packet.
         let delay = (((_rep_status & 0xFC) as u16) << 6) | (delay_lsb as u16);
@@ -275,7 +283,16 @@ where
         let data5: i16 =
             Self::try_read_i16_at_cursor(msg, &mut cursor).unwrap_or(0);
 
-        (cursor, feature_report_id, delay, data1, data2, data3, data4, data5)
+        (
+            cursor,
+            feature_report_id,
+            delay,
+            data1,
+            data2,
+            data3,
+            data4,
+            data5,
+        )
     }
 
     /// Handle parsing of an input report packet,
@@ -288,19 +305,28 @@ where
         }
 
         // Loop through the packet payload as long as there is enough room for at least a report header (4 bytes)
-        while (received_len > outer_cursor) && (received_len - outer_cursor >= 4) {
+        while (received_len > outer_cursor)
+            && (received_len - outer_cursor >= 4)
+        {
             let report_id = self.packet_recv_buf[outer_cursor];
-            
+
             // Dynamically determine the exact length of the report based on its ID
             let report_len = match report_id {
                 0xFB => 5, // Base Timestamp Reference
                 0xFA => 5, // Timestamp Rebase
-                SENSOR_REPORTID_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR | 0x09 => 14, // 14 bytes (includes accuracy estimate)
-                SENSOR_REPORTID_GAME_ROTATION_VECTOR | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12,   // 12 bytes (no accuracy estimate)
-                SENSOR_REPORTID_LINEAR_ACCEL | SENSOR_REPORTID_GYRO_CALIBRATED | 0x01 | 0x03 | 0x06 => 10, // 3-axis vectors
+                SENSOR_REPORTID_ROTATION_VECTOR
+                | SENSOR_REPORTID_ARVR_STABILIZED_ROTATION_VECTOR
+                | 0x09 => 14, // 14 bytes (includes accuracy estimate)
+                SENSOR_REPORTID_GAME_ROTATION_VECTOR
+                | SENSOR_REPORTID_ARVR_STABILIZED_GAME_ROTATION_VECTOR => 12, // 12 bytes (no accuracy estimate)
+                SENSOR_REPORTID_LINEAR_ACCEL
+                | SENSOR_REPORTID_ACCELEROMETER
+                | SENSOR_REPORTID_GYRO_CALIBRATED
+                | 0x03
+                | 0x06 => 10, // 3-axis vectors
                 SENSOR_REPORTID_GYRO => 16, // 3-axis vectors + 2-byte biases per axis
                 _ => {
-                    // We encountered an unknown report ID. 
+                    // We encountered an unknown report ID.
                     // Break out entirely to avoid misaligning the cursor and corrupting subsequent batched reports.
                     break;
                 }
@@ -308,7 +334,7 @@ where
 
             // Ensure we actually have all the bytes for this report in the buffer
             if received_len - outer_cursor < report_len {
-                break; 
+                break;
             }
 
             let report_end = outer_cursor + report_len;
@@ -339,15 +365,23 @@ where
                 outer_cursor = report_end;
                 continue;
             }
-            
-            // Slice the buffer EXACTLY to the bounds of the current report length. 
+
+            // Slice the buffer EXACTLY to the bounds of the current report length.
             // This prevents the eager i16 reader from consuming bytes that belong to the *next* batched report.
-            let (_inner_cursor, _parsed_id, delay, data1, data2, data3, data4, data5) =
-                Self::handle_one_input_report(
-                    outer_cursor,
-                    &self.packet_recv_buf[..report_end],
-                );
-            
+            let (
+                _inner_cursor,
+                _parsed_id,
+                delay,
+                data1,
+                data2,
+                data3,
+                data4,
+                data5,
+            ) = Self::handle_one_input_report(
+                outer_cursor,
+                &self.packet_recv_buf[..report_end],
+            );
+
             // Manually advance the cursor by the known physical length of the report
             outer_cursor = report_end;
 
@@ -372,6 +406,9 @@ where
                     self.update_arvr_game_rotation_quaternion(
                         data1, data2, data3, data4,
                     );
+                }
+                SENSOR_REPORTID_ACCELEROMETER => {
+                    self.update_accelerometer(data1, data2, data3, delay);
                 }
                 SENSOR_REPORTID_LINEAR_ACCEL => {
                     self.update_linear_accel(data1, data2, data3);
@@ -470,16 +507,24 @@ where
         self.linear_accel = [x, y, z];
     }
 
+    /// Update accelerometer data
+    fn update_accelerometer(&mut self, x: i16, y: i16, z: i16, delay: u16) {
+        let timestamp = self.timestamp.wrapping_add(delay as u32);
+        self.accel_queue[self.accel_queue_head] =
+            (timestamp, [q8_to_f32(x), q8_to_f32(y), q8_to_f32(z)]);
+        self.accel_queue_head = (self.accel_queue_head + 1) % 32;
+        if self.accel_queue_len < 32 {
+            self.accel_queue_len += 1;
+        }
+    }
+
     /// Update uncalibrated gyro data
-    /// Given a set of linear acceleration values in the Q-fixed-point format,
+    /// Given a set of gyroscope values in the Q-fixed-point format,
     /// calculate and update the corresponding float values
     fn update_gyro(&mut self, x: i16, y: i16, z: i16, delay: u16) {
         let timestamp = self.timestamp.wrapping_add(delay as u32);
-        self.gyro_queue[self.gyro_queue_head] = (timestamp, [
-            q9_to_f32(x),
-            q9_to_f32(y),
-            q9_to_f32(z),
-        ]);
+        self.gyro_queue[self.gyro_queue_head] =
+            (timestamp, [q9_to_f32(x), q9_to_f32(y), q9_to_f32(z)]);
         self.gyro_queue_head = (self.gyro_queue_head + 1) % 32;
         if self.gyro_queue_len < 32 {
             self.gyro_queue_len += 1;
@@ -489,12 +534,10 @@ where
     /// Update calibrated gyro data
     fn update_gyro_calibrated(&mut self, x: i16, y: i16, z: i16, delay: u16) {
         let timestamp = self.timestamp.wrapping_add(delay as u32);
-        self.calibrated_gyro_queue[self.calibrated_gyro_queue_head] = (timestamp, [
-            q9_to_f32(x),
-            q9_to_f32(y),
-            q9_to_f32(z),
-        ]);
-        self.calibrated_gyro_queue_head = (self.calibrated_gyro_queue_head + 1) % 32;
+        self.calibrated_gyro_queue[self.calibrated_gyro_queue_head] =
+            (timestamp, [q9_to_f32(x), q9_to_f32(y), q9_to_f32(z)]);
+        self.calibrated_gyro_queue_head =
+            (self.calibrated_gyro_queue_head + 1) % 32;
         if self.calibrated_gyro_queue_len < 32 {
             self.calibrated_gyro_queue_len += 1;
         }
@@ -700,6 +743,17 @@ where
         self.enable_report(SENSOR_REPORTID_LINEAR_ACCEL, millis_between_reports)
     }
 
+    /// Enables reporting of accelerometer data.
+    pub fn enable_accelerometer(
+        &mut self,
+        millis_between_reports: u16,
+    ) -> Result<(), WrapperError<SE>> {
+        self.enable_report(
+            SENSOR_REPORTID_ACCELEROMETER,
+            millis_between_reports,
+        )
+    }
+
     /// Enables reporting of gyroscope data.
     pub fn enable_gyro(
         &mut self,
@@ -713,7 +767,10 @@ where
         &mut self,
         millis_between_reports: u16,
     ) -> Result<(), WrapperError<SE>> {
-        self.enable_report(SENSOR_REPORTID_GYRO_CALIBRATED, millis_between_reports)
+        self.enable_report(
+            SENSOR_REPORTID_GYRO_CALIBRATED,
+            millis_between_reports,
+        )
     }
 
     /// Enable a particular report
@@ -866,12 +923,16 @@ where
     }
 
     /// Read game rotation normalized quaternion:
-    pub fn game_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+    pub fn game_rotation_quaternion(
+        &self,
+    ) -> Result<[f32; 4], WrapperError<SE>> {
         Ok(self.game_rotation_quaternion)
     }
 
     /// Read AR/VR stabilized normalized quaternion:
-    pub fn arvr_stabilized_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+    pub fn arvr_stabilized_rotation_quaternion(
+        &self,
+    ) -> Result<[f32; 4], WrapperError<SE>> {
         Ok(self.arvr_rotation_quaternion)
     }
 
@@ -880,13 +941,33 @@ where
     }
 
     /// Read AR/VR stabilized game rotation normalized quaternion:
-    pub fn arvr_stabilized_game_rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
+    pub fn arvr_stabilized_game_rotation_quaternion(
+        &self,
+    ) -> Result<[f32; 4], WrapperError<SE>> {
         Ok(self.arvr_game_rotation_quaternion)
     }
 
     /// Read linear acceleration (m/s^2)
     pub fn linear_accel(&self) -> Result<[f32; 3], WrapperError<SE>> {
         Ok(self.linear_accel)
+    }
+
+    /// Drain the accelerometer queue (returns length and array of (timestamp, [m/s^2]))
+    pub fn accel_queue(&mut self) -> (usize, [(u32, [f32; 3]); 32]) {
+        let mut ordered_queue = [(0, [0.0; 3]); 32];
+        let len = self.accel_queue_len;
+
+        if len > 0 {
+            let mut current = (self.accel_queue_head + 32 - len) % 32;
+            for i in 0..len {
+                ordered_queue[i] = self.accel_queue[current];
+                current = (current + 1) % 32;
+            }
+        }
+
+        self.accel_queue_head = 0;
+        self.accel_queue_len = 0;
+        (len, ordered_queue)
     }
 
     /// Drain the uncalibrated gyro queue (returns length and array of (timestamp, [rad/s]))
@@ -1054,7 +1135,8 @@ const SHUB_COMMAND_RESP: u8 = 0xF1;
 // 0x78, 0x7C
 
 /// Report IDs from SH2 Reference Manual:
-// 0x01 accelerometer (m/s^2 including gravity): Q point 8
+/// Accelerometer (m/s^2 including gravity): Q point 8
+const SENSOR_REPORTID_ACCELEROMETER: u8 = 0x01;
 // 0x02 gyroscope calibrated (rad/s): Q point 9
 // 0x03 mag field calibrated (uTesla): Q point 4
 /// Linear acceleration (m/s^2 minus gravity): Q point 8
@@ -1104,7 +1186,7 @@ mod tests {
     // use crate::interface::i2c::DEFAULT_ADDRESS;
     // use crate::interface::mock_i2c_port::FakeI2cPort;
     // use crate::wrapper::{q14_to_f32, BNO080, Q14_SCALE};
-    use crate::wrapper::{q14_to_f32, Q14_SCALE};
+    use crate::wrapper::{Q14_SCALE, q14_to_f32};
 
     // use crate::interface::I2cInterface;
 
